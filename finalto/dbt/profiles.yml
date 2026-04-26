@@ -1,0 +1,21 @@
+yelp_databricks:
+  target: prod
+  outputs:
+
+    prod:
+      type: databricks
+      catalog: yelp_catalog           # Unity Catalog name
+      schema: gold                    # default schema (overridden per model)
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      threads: 8
+
+    dev:
+      type: databricks
+      catalog: yelp_catalog_dev
+      schema: gold_dev
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH_DEV') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      threads: 4

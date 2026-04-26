@@ -1,0 +1,216 @@
+version: 2
+
+# ─── Mart Models ──────────────────────────────────────────────────
+# The Gold star schema. These are the tables BI tools query.
+#
+# Fact tables  : incremental materialisation — only new rows per run
+# Dimension tables: table materialisation — full refresh (SCD Type 1)
+#
+# All foreign key relationships are enforced via dbt relationships tests.
+# A failed FK test means a fact row references a dimension that doesn't
+# exist — this blocks the DAG before BI is served.
+
+models:
+
+  # ── Fact Tables ─────────────────────────────────────────────────
+
+  - name: fact_reviews
+    description: >
+      Primary analytical fact table. One row per review.
+      Incrementally materialised — only new reviews processed per run.
+      Z-ordered on business_id and user_id via post_hook for fast BI filtering.
+    columns:
+      - name: review_id
+        description: "Unique review identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: business_id
+        description: "FK to dim_business"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_business')
+              field: business_id
+      - name: user_id
+        description: "FK to dim_user"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_user')
+              field: user_id
+      - name: date_id
+        description: "FK to dim_date"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_id
+      - name: review_stars
+        description: "Star rating given by the reviewer (1.0–5.0)"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1.0, 2.0, 3.0, 4.0, 5.0]
+      - name: useful_votes
+        description: "Number of useful votes this review received"
+        tests:
+          - not_null
+      - name: funny_votes
+        description: "Number of funny votes this review received"
+        tests:
+          - not_null
+      - name: cool_votes
+        description: "Number of cool votes this review received"
+        tests:
+          - not_null
+      - name: review_length_chars
+        description: "Character count of the review text"
+      - name: year
+        description: "Year the review was written — partition column"
+      - name: month
+        description: "Month the review was written — partition column"
+
+  - name: fact_checkins
+    description: >
+      Checkin events fact table. One row per checkin event.
+      Incrementally materialised — only new events processed per run.
+      Z-ordered on business_id via post_hook.
+    columns:
+      - name: checkin_id
+        description: "Unique checkin event identifier (PK — surrogate)"
+        tests:
+          - unique
+          - not_null
+      - name: business_id
+        description: "FK to dim_business"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_business')
+              field: business_id
+      - name: date_id
+        description: "FK to dim_date"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_id
+      - name: checkin_hour
+        description: "Hour of day the checkin occurred (0–23)"
+      - name: checkin_day_of_week
+        description: "Day of week the checkin occurred e.g. Monday"
+      - name: year
+        description: "Year of the checkin — partition column"
+      - name: month
+        description: "Month of the checkin — partition column"
+
+  # ── Dimension Tables ─────────────────────────────────────────────
+
+  - name: dim_business
+    description: >
+      Business dimension. One row per business (SCD Type 1 — latest state wins).
+      Full refresh on every run. primary_category is denormalised in
+      from the bridge table via int_business_categories.
+    columns:
+      - name: business_id
+        description: "Unique business identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: name
+        description: "Business name"
+        tests:
+          - not_null
+      - name: city
+        description: "City — defaults to UNKNOWN if null in source"
+      - name: state
+        description: "State code — defaults to UNKNOWN if null in source"
+      - name: stars
+        description: "Overall Yelp rating across all reviews"
+      - name: review_count
+        description: "Total lifetime review count"
+      - name: is_open
+        description: "True if business is currently open"
+        tests:
+          - accepted_values:
+              values: [true, false]
+      - name: primary_category
+        description: "Primary business category — first category alphabetically"
+
+  - name: dim_user
+    description: >
+      User dimension. One row per user (SCD Type 1).
+      Full refresh on every run.
+      user_name is flagged as PII in metadata.
+    columns:
+      - name: user_id
+        description: "Unique user identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: name
+        description: "User first name"
+        meta:
+          pii: true
+      - name: review_count
+        description: "Lifetime review count"
+      - name: average_stars
+        description: "Lifetime average star rating given"
+      - name: is_elite
+        description: "True if user has ever been Yelp Elite"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+      - name: elite_years_count
+        description: "Number of years user held Elite status"
+      - name: fan_count
+        description: "Number of fans"
+      - name: yelping_since_year
+        description: "Year the user joined Yelp"
+      - name: total_useful_votes
+        description: "Total useful votes received across all reviews"
+      - name: total_funny_votes
+        description: "Total funny votes received"
+      - name: total_cool_votes
+        description: "Total cool votes received"
+
+  - name: dim_date
+    description: >
+      Date dimension — static date spine generated by dbt_utils.date_spine.
+      Covers 2004-01-01 (earliest Yelp review) to current_date.
+      Not derived from source data — built entirely by dbt.
+      Rebuilt once and rarely needs updating.
+    columns:
+      - name: date_id
+        description: "Surrogate integer key (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: full_date
+        description: "Calendar date"
+        tests:
+          - unique
+          - not_null
+      - name: year
+        description: "Calendar year"
+        tests:
+          - not_null
+      - name: month
+        description: "Calendar month (1–12)"
+        tests:
+          - not_null
+      - name: quarter
+        description: "Calendar quarter (1–4)"
+      - name: day_of_week
+        description: "Day of week as integer (1=Sunday, 7=Saturday)"
+      - name: day_name
+        description: "Day name e.g. Monday, Tuesday"
+      - name: week_of_year
+        description: "ISO week number"
+      - name: is_weekend
+        description: "True if Saturday or Sunday"
+        tests:
+          - accepted_values:
+              values: [true, false]

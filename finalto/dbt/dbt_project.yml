@@ -1,0 +1,33 @@
+name: yelp_analytics
+version: "1.0.0"
+config-version: 2
+
+profile: yelp_databricks
+
+model-paths:  ["models"]
+test-paths:   ["tests"]
+macro-paths:  ["macros"]
+
+target-path:  "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  yelp_analytics:
+    staging:
+      +materialized: view
+      +schema: silver_staging
+
+    intermediate:
+      +materialized: ephemeral
+
+    marts:
+      +materialized: table
+      +schema: gold
+
+      fact_reviews:
+        +materialized: incremental
+        +unique_key: review_id
+
+      fact_checkins:
+        +materialized: incremental
+        +unique_key: checkin_id

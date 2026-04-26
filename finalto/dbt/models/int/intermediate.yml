@@ -1,0 +1,72 @@
+version: 2
+
+# ─── Intermediate Models ──────────────────────────────────────────
+# These models are materialised as ephemeral — they do not create
+# physical tables. They compile into CTEs inside whichever mart
+# model references them via {{ ref() }}.
+#
+# Think of them as reusable building blocks that live between
+# staging (raw rename) and marts (final BI tables).
+
+models:
+  - name: int_reviews_with_dates
+    description: >
+      Joins stg_reviews to dim_date to resolve the date_id foreign key
+      needed by fact_reviews. Keeps one row per review.
+    columns:
+      - name: review_id
+        description: "Unique review identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: date_id
+        description: "FK to dim_date — resolved by joining reviewed_at to dim_date.full_date"
+        tests:
+          - not_null
+
+  - name: int_business_categories
+    description: >
+      Derives the primary_category per business from the Silver
+      business_categories bridge table. Uses ROW_NUMBER() to pick
+      the first category alphabetically. One row per business.
+    columns:
+      - name: business_id
+        description: "Unique business identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: primary_category
+        description: "First category assigned to the business (alphabetical)"
+        tests:
+          - not_null
+
+  - name: int_rising_star_candidates
+    description: >
+      Identifies businesses qualifying as rising stars.
+      Splits reviews into two time windows (past 12 months vs before),
+      computes average stars per window, and returns only businesses
+      where recent average is at least 1.0 star higher than historical
+      AND they received at least 10 recent reviews.
+      This model is the direct answer to SQL Section 3 of the assessment.
+    columns:
+      - name: business_id
+        description: "Unique business identifier"
+        tests:
+          - unique
+          - not_null
+      - name: avg_stars_recent
+        description: "Average star rating in the past 12 months"
+        tests:
+          - not_null
+      - name: avg_stars_historical
+        description: "Average star rating before the past 12 months"
+        tests:
+          - not_null
+      - name: rating_improvement
+        description: "Difference: avg_stars_recent minus avg_stars_historical"
+        tests:
+          - not_null
+      - name: review_count_recent
+        description: "Number of reviews received in the past 12 months (minimum 10 to qualify)"
+        tests:
+          - not_null

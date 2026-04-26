@@ -1,0 +1,254 @@
+version: 2
+
+# ─── Sources ─────────────────────────────────────────────────────
+# Silver Delta tables produced by PySpark silver_transform.py.
+# dbt reads these as source tables — it does not own or build them.
+
+sources:
+  - name: silver
+    description: "Cleaned and conformed Silver layer tables — produced by PySpark on EMR"
+    database: yelp_catalog
+    schema: silver
+
+    freshness:
+      warn_after:  {count: 25, period: hour}
+      error_after: {count: 48, period: hour}
+
+    loaded_at_field: review_date   # used by dbt source freshness checks
+
+    tables:
+      - name: reviews
+        description: "One row per review — cleaned, typed, deduplicated"
+        columns:
+          - name: review_id
+            description: "Unique review identifier (PK)"
+          - name: business_id
+            description: "FK to silver.business"
+          - name: user_id
+            description: "FK to silver.users"
+          - name: stars
+            description: "Star rating given (1–5)"
+          - name: review_date
+            description: "Timestamp of the review (parsed from source string)"
+
+      - name: business
+        description: "One row per business — cleaned, typed, categories removed to bridge table"
+        columns:
+          - name: business_id
+            description: "Unique business identifier (PK)"
+
+      - name: users
+        description: "One row per user — is_elite and elite_years_count derived from raw elite string"
+        columns:
+          - name: user_id
+            description: "Unique user identifier (PK)"
+
+      - name: checkin_events
+        description: "One row per checkin event — exploded from the raw comma-separated date blob"
+        columns:
+          - name: checkin_id
+            description: "Surrogate PK — md5(business_id || checkin_ts)"
+
+      - name: business_categories
+        description: "Bridge table — one row per business/category combination"
+
+# ─── Staging Models ──────────────────────────────────────────────
+
+models:
+  - name: stg_reviews
+    description: "Staging: Silver reviews with renamed columns and review_length_chars derived"
+    columns:
+      - name: review_id
+        description: "Unique review identifier"
+        tests:
+          - unique
+          - not_null
+      - name: business_id
+        tests: [not_null]
+      - name: user_id
+        tests: [not_null]
+      - name: review_stars
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1.0, 2.0, 3.0, 4.0, 5.0]
+      - name: reviewed_at
+        tests: [not_null]
+
+  - name: stg_business
+    description: "Staging: Silver business with renamed columns"
+    columns:
+      - name: business_id
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_users
+    description: "Staging: Silver users with is_elite flag and yelping_since_year derived"
+    columns:
+      - name: user_id
+        tests:
+          - unique
+          - not_null
+      - name: is_elite
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+
+  - name: stg_checkins
+    description: "Staging: Silver checkin_events with renamed columns"
+    columns:
+      - name: checkin_id
+        tests:
+          - unique
+          - not_null
+      - name: business_id
+        tests: [not_null]
+
+# ─── Intermediate Models ──────────────────────────────────────────
+
+  - name: int_reviews_with_dates
+    description: "Reviews joined to dim_date to resolve date_id FK"
+    columns:
+      - name: review_id
+        tests:
+          - unique
+          - not_null
+
+  - name: int_business_categories
+    description: "Primary category per business — one row per business"
+    columns:
+      - name: business_id
+        tests:
+          - unique
+          - not_null
+
+  - name: int_rising_star_candidates
+    description: "Businesses qualifying as rising stars — recent avg at least 1 star above historical"
+    columns:
+      - name: business_id
+        tests:
+          - unique
+          - not_null
+      - name: rating_improvement
+        description: "Difference between recent and historical average star rating"
+        tests:
+          - not_null
+
+# ─── Mart Models ─────────────────────────────────────────────────
+
+  - name: fact_reviews
+    description: >
+      Primary analytical fact table. One row per review.
+      Joins to dim_business, dim_user, and dim_date via foreign keys.
+    columns:
+      - name: review_id
+        description: "Unique review identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: business_id
+        description: "FK to dim_business"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_business')
+              field: business_id
+      - name: user_id
+        description: "FK to dim_user"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_user')
+              field: user_id
+      - name: date_id
+        description: "FK to dim_date"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_id
+      - name: review_stars
+        description: "Star rating given by the reviewer (1.0–5.0)"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1.0, 2.0, 3.0, 4.0, 5.0]
+      - name: useful_votes
+        tests: [not_null]
+      - name: funny_votes
+        tests: [not_null]
+      - name: cool_votes
+        tests: [not_null]
+
+  - name: fact_checkins
+    description: "Checkin events fact table. One row per checkin event."
+    columns:
+      - name: checkin_id
+        description: "Unique checkin event identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: business_id
+        description: "FK to dim_business"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_business')
+              field: business_id
+      - name: date_id
+        description: "FK to dim_date"
+        tests:
+          - not_null
+
+  - name: dim_business
+    description: "Business dimension. One row per business (SCD Type 1)."
+    columns:
+      - name: business_id
+        description: "Unique business identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: name
+        tests: [not_null]
+      - name: is_open
+        tests:
+          - accepted_values:
+              values: [true, false]
+
+  - name: dim_user
+    description: "User dimension. One row per user (SCD Type 1)."
+    columns:
+      - name: user_id
+        description: "Unique user identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: user_name
+        description: "PII — user first name. Flagged for access control review."
+        meta:
+          pii: true
+      - name: is_elite
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+
+  - name: dim_date
+    description: "Date dimension (date spine). One row per calendar date from 2004-01-01."
+    columns:
+      - name: date_id
+        description: "Surrogate integer key (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: full_date
+        description: "Calendar date"
+        tests:
+          - unique
+          - not_null
+      - name: is_weekend
+        tests:
+          - accepted_values:
+              values: [true, false]

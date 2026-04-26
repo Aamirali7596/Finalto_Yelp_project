@@ -1,0 +1,149 @@
+version: 2
+
+# ─── staging.yml ──────────────────────────────────────────────────
+# Model definitions and tests for the staging layer.
+# Staging models are thin wrappers on Silver sources —
+# they rename columns, apply light casting, and add no business logic.
+# Materialised as views — no storage cost, always reads fresh from Silver.
+#
+# Sources are defined separately in dbt/sources.yml
+# ─────────────────────────────────────────────────────────────────
+
+models:
+  - name: stg_reviews
+    description: >
+      Staging wrapper on silver.reviews. Renames columns to
+      business-friendly names and derives review_length_chars
+      from the raw text field.
+    columns:
+      - name: review_id
+        description: "Unique review identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: business_id
+        description: "FK to stg_business"
+        tests:
+          - not_null
+      - name: user_id
+        description: "FK to stg_users"
+        tests:
+          - not_null
+      - name: review_stars
+        description: "Star rating given (1.0–5.0) — renamed from stars"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1.0, 2.0, 3.0, 4.0, 5.0]
+      - name: reviewed_at
+        description: "Timestamp the review was written — renamed from review_date"
+        tests:
+          - not_null
+      - name: useful_votes
+        description: "Useful votes received — renamed from useful"
+      - name: funny_votes
+        description: "Funny votes received — renamed from funny"
+      - name: cool_votes
+        description: "Cool votes received — renamed from cool"
+      - name: review_length_chars
+        description: "Character count of review text — derived via length(text)"
+      - name: year
+        description: "Partition column passed through from Silver"
+      - name: month
+        description: "Partition column passed through from Silver"
+
+  - name: stg_business
+    description: >
+      Staging wrapper on silver.business. Renames columns
+      and selects fields relevant to Gold models.
+    columns:
+      - name: business_id
+        description: "Unique business identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: business_name
+        description: "Business name — renamed from name"
+        tests:
+          - not_null
+      - name: city
+        description: "City"
+      - name: state
+        description: "State code"
+      - name: postal_code
+        description: "Postcode"
+      - name: latitude
+        description: "Geographic latitude"
+      - name: longitude
+        description: "Geographic longitude"
+      - name: overall_stars
+        description: "Overall Yelp rating — renamed from stars"
+      - name: total_review_count
+        description: "Total lifetime reviews — renamed from review_count"
+      - name: is_currently_open
+        description: "True if business is currently open — renamed from is_open"
+
+  - name: stg_users
+    description: >
+      Staging wrapper on silver.users. Exposes is_elite flag
+      and yelping_since_year derived at Silver.
+    columns:
+      - name: user_id
+        description: "Unique user identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: user_name
+        description: "User first name (PII — flagged in meta)"
+        meta:
+          pii: true
+      - name: lifetime_review_count
+        description: "Total reviews written — renamed from review_count"
+      - name: lifetime_avg_stars
+        description: "Lifetime average stars given — renamed from average_stars"
+      - name: is_elite
+        description: "True if user has ever held Elite status"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+      - name: elite_years_count
+        description: "Number of years user held Elite status"
+      - name: fan_count
+        description: "Number of fans — renamed from fans"
+      - name: yelping_since_year
+        description: "Year user joined Yelp — derived from yelping_since timestamp"
+      - name: useful
+        description: "Total useful votes received"
+      - name: funny
+        description: "Total funny votes received"
+      - name: cool
+        description: "Total cool votes received"
+
+  - name: stg_checkins
+    description: >
+      Staging wrapper on silver.checkin_events. The date blob was
+      already exploded into individual rows at Silver — this model
+      renames and selects.
+    columns:
+      - name: checkin_id
+        description: "Unique checkin event identifier (PK)"
+        tests:
+          - unique
+          - not_null
+      - name: business_id
+        description: "FK to stg_business"
+        tests:
+          - not_null
+      - name: checkin_ts
+        description: "Timestamp of the checkin event"
+        tests:
+          - not_null
+      - name: checkin_hour
+        description: "Hour of day (0–23)"
+      - name: checkin_day_of_week
+        description: "Day name e.g. Monday, Tuesday"
+      - name: year
+        description: "Partition column"
+      - name: month
+        description: "Partition column"
