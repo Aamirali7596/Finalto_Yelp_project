@@ -127,8 +127,9 @@ erDiagram
     DIM_BUSINESS ||--o{ DIM_BUSINESS_HISTORY : "versions"
     DIM_USER     ||--o{ DIM_USER_HISTORY     : "versions"
 
-```
+
 ## Repo Structure
+```
 finalto/
 │
 ├── data_engineering/
