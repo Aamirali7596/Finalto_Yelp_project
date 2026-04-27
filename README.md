@@ -113,6 +113,11 @@ erDiagram
 ```
 
 ### Gold star schema — what BI queries
+
+```md
+### Gold star schema — what BI queries
+
+```mermaid
 erDiagram
 
     FACT_REVIEWS  }o--|| DIM_BUSINESS : "about"
@@ -124,6 +129,7 @@ erDiagram
 
     DIM_BUSINESS ||--o{ DIM_BUSINESS_HISTORY : "versions"
     DIM_USER     ||--o{ DIM_USER_HISTORY     : "versions"
+
 ---
 
 ## Repo Structure
