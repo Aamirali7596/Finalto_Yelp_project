@@ -116,15 +116,19 @@ erDiagram
 
 ```mermaid
 erDiagram
+
     FACT_REVIEWS  }o--|| DIM_BUSINESS : "about"
     FACT_REVIEWS  }o--|| DIM_USER     : "written by"
     FACT_REVIEWS  }o--|| DIM_DATE     : "on"
+
     FACT_CHECKINS }o--|| DIM_BUSINESS : "at"
     FACT_CHECKINS }o--|| DIM_DATE     : "on"
-```
-## Repo Structure
+
+    DIM_BUSINESS ||--o{ DIM_BUSINESS_HISTORY : "versions"
+    DIM_USER     ||--o{ DIM_USER_HISTORY     : "versions"
 
 ```
+## Repo Structure
 finalto/
 │
 ├── data_engineering/
