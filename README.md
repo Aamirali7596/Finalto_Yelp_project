@@ -128,6 +128,8 @@ erDiagram
     DIM_USER     ||--o{ DIM_USER_HISTORY     : "versions"
 
 
+```
+
 ## Repo Structure
 ```
 finalto/
