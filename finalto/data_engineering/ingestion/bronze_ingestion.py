@@ -5,7 +5,6 @@ Reads raw Yelp JSON files from S3 and writes to Delta Lake (Bronze).
 Lookback: Re-processes the last N days on every run to catch
           late-arriving source data. Safe to re-run — dynamic
           partition overwrite only replaces affected partitions.
-
 Usage:
   spark-submit bronze_ingestion.py --env prod --date 2026-04-26 --lookback 3
 """
@@ -216,6 +215,9 @@ def main():
     parser.add_argument("--entity",   default="all")
     args = parser.parse_args()
 
+    # For a daily batch export the full source file is re-read each run.
+    # The lookback window determines how many date partitions to overwrite,
+    # not which records to filter from the source file.
     paths = PATHS[args.env]
     dates = get_lookback_dates(args.date, args.lookback)
     run_date = dates[-1]   # latest date in the window = partition key

@@ -51,6 +51,8 @@ models:
         description: "Partition column passed through from Silver"
       - name: month
         description: "Partition column passed through from Silver"
+      - name: text
+        description: "Full review text (PII — used only to derive review_length_chars at staging)"
 
   - name: stg_business
     description: >

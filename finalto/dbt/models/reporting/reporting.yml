@@ -1,0 +1,120 @@
+version: 2
+
+# ─── reporting.yml ────────────────────────────────────────────────
+# Reporting views sit on top of the Gold star schema.
+# These are what BI tools query — not the raw fact tables directly.
+# Materialised as views so they always reflect the latest Gold data.
+# Schema: gold_reporting
+# ─────────────────────────────────────────────────────────────────
+
+models:
+  - name: vw_rising_stars
+    description: >
+      Businesses that have significantly improved their ratings.
+      Requires at least 10 reviews in the past 12 months and an
+      average rating at least 1.0 star higher than their historical average.
+      Direct answer to SQL Section 3 of the assessment.
+      Adds improvement_tier classification for easy BI filtering.
+    columns:
+      - name: business_id
+        description: "Unique business identifier"
+        tests:
+          - unique
+          - not_null
+      - name: business_name
+        description: "Business name"
+        tests:
+          - not_null
+      - name: city
+        description: "City the business is located in"
+      - name: state
+        description: "State code"
+      - name: primary_category
+        description: "Primary business category"
+      - name: avg_stars_recent
+        description: "Average star rating in the past 12 months"
+        tests:
+          - not_null
+      - name: avg_stars_historical
+        description: "Average star rating before the past 12 months"
+        tests:
+          - not_null
+      - name: rating_improvement
+        description: "Difference between recent and historical average (always >= 1.0)"
+        tests:
+          - not_null
+      - name: review_count_recent
+        description: "Number of reviews in the past 12 months (always >= 10)"
+        tests:
+          - not_null
+      - name: improvement_tier
+        description: "Classification: Major improvement (>=2.0), Strong improvement (>=1.5), Improvement (>=1.0)"
+        tests:
+          - accepted_values:
+              values: ['Major improvement', 'Strong improvement', 'Improvement']
+
+  - name: vw_top_businesses_by_city
+    description: >
+      Top rated businesses grouped by city, category, and year.
+      Only includes businesses with at least 10 reviews.
+      Powers Best of Yelp style dashboards.
+      BI teams filter by city, category, or year without writing joins.
+    columns:
+      - name: business_id
+        description: "Unique business identifier"
+        tests:
+          - not_null
+      - name: business_name
+        description: "Business name"
+        tests:
+          - not_null
+      - name: city
+        description: "City"
+        tests:
+          - not_null
+      - name: primary_category
+        description: "Primary business category"
+      - name: year
+        description: "Year of the reviews included in this aggregation"
+        tests:
+          - not_null
+      - name: avg_rating
+        description: "Average star rating for this business in this year"
+        tests:
+          - not_null
+      - name: total_reviews
+        description: "Total reviews received in this year (minimum 10)"
+        tests:
+          - not_null
+
+  - name: vw_review_trends
+    description: >
+      Monthly review volume and average rating across all of Yelp.
+      Shows platform growth over time and sentiment trends.
+      One row per year-month combination.
+    columns:
+      - name: year
+        description: "Calendar year"
+        tests:
+          - not_null
+      - name: month
+        description: "Calendar month (1-12)"
+        tests:
+          - not_null
+      - name: year_month
+        description: "Formatted label for charting e.g. 2023-06"
+        tests:
+          - unique
+          - not_null
+      - name: total_reviews
+        description: "Total reviews written in this month"
+        tests:
+          - not_null
+      - name: avg_rating
+        description: "Average star rating across all reviews in this month"
+        tests:
+          - not_null
+      - name: avg_useful_votes
+        description: "Average useful votes per review in this month"
+      - name: avg_review_length
+        description: "Average character count of reviews in this month"

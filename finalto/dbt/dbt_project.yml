@@ -13,13 +13,23 @@ clean-targets: ["target", "dbt_packages"]
 
 models:
   yelp_analytics:
+
+    # ── Staging ───────────────────────────────────────────────────
+    # Views only — staging is a translation layer on top of Silver.
+    # No storage cost. History lives in Silver Delta tables, not here.
     staging:
       +materialized: view
       +schema: silver_staging
 
+    # ── Intermediate ──────────────────────────────────────────────
+    # Ephemeral — compiled as CTEs inside mart queries.
+    # Never written to disk. Business logic only.
     intermediate:
       +materialized: ephemeral
 
+    # ── Marts ─────────────────────────────────────────────────────
+    # Default: table (full refresh) for dimensions.
+    # Fact tables override to incremental — only new rows per run.
     marts:
       +materialized: table
       +schema: gold
@@ -31,3 +41,11 @@ models:
       fact_checkins:
         +materialized: incremental
         +unique_key: checkin_id
+
+    # ── Reporting ─────────────────────────────────────────────────
+    # Materialised views on top of Gold fact and dimension tables.
+    # BI tools query these — not the raw fact tables directly.
+    # Rebuilt automatically when underlying Gold tables change.
+    reporting:
+      +materialized: view
+      +schema: gold_reporting

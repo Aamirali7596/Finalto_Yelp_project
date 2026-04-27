@@ -34,9 +34,9 @@ staged as (
         month
 
     from source
-    where review_id    is not null
-      and review_stars between 1.0 and 5.0
-      and reviewed_at  is not null
+    -- Silver guarantees stars are 1.0–5.0 — no re-validation needed here
+    where review_id   is not null
+    and reviewed_at is not null
 )
 
 select * from staged
