@@ -13,6 +13,29 @@ Yelp publishes a dataset of businesses, reviews, users, checkins, and tips as ra
 ```
 Raw JSON files  →  Clean it  →  Model it  →  Business reports
 ```
+# Executive Summary
+
+This project transforms raw Yelp source data into trusted analytical products through layered engineering:
+
+Raw Sources  
+→ Bronze Ingestion  
+→ Silver Cleansed Data  
+→ Gold Analytics Models  
+→ Reporting Views
+
+Supports both:
+
+- Production-style engineering concerns  
+- Business intelligence use cases
+
+Key capabilities:
+- Incremental fact processing
+- SCD Type 1 and Type 2 dimensions
+- Data quality and anomaly testing
+- Reprocessing / recovery strategy
+- BI-ready semantic reporting models
+
+---
 
 ---
 
