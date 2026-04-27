@@ -16,9 +16,9 @@ Raw JSON files  →  Clean it  →  Model it  →  Business reports
 
 ---
 
-## The Three-Layer Architecture
+## The Four-Layer Architecture
 
-Every record passes through three layers before reaching a dashboard. Each layer has one job.
+Every record passes through four layers before reaching a dashboard.
 
 ```mermaid
 flowchart LR
@@ -29,18 +29,23 @@ flowchart LR
     Ready to model"]
     B -->|dbt models| C["Gold
     Star schema
-    BI-ready tables"]
+    Fact + Dim tables"]
+    C -->|dbt views| D["Reporting
+    Pre-joined views
+    for BI tools"]
 
     style A fill:#E1F5EE,stroke:#085041,color:#04342C
     style B fill:#E1F5EE,stroke:#085041,color:#04342C
     style C fill:#EEEDFE,stroke:#3C3489,color:#26215C
+    style D fill:#DDD9FC,stroke:#3C3489,color:#26215C
 ```
 
 | Layer | What it does | Tool | Who reads it |
 |---|---|---|---|
-| **Bronze** | Stores raw data exactly as received. Never modified. | PySpark on EMR | Silver pipeline only |
-| **Silver** | Fixes types, removes duplicates, flattens messy fields | PySpark on EMR | Gold (dbt) only |
-| **Gold** | Final star schema — clean tables built for BI queries | dbt on Databricks | BI tools, analysts |
+| **Bronze** | Raw data exactly as received — never modified | PySpark on EMR | Silver pipeline only |
+| **Silver** | Types fixed, duplicates removed, fields flattened | PySpark on EMR | Gold (dbt) only |
+| **Gold** | Star schema — fact and dimension tables | dbt on Databricks | Reporting views |
+| **Reporting** | Pre-joined views for specific BI use cases | dbt views | BI tools, analysts |
 
 ---
 
@@ -50,7 +55,7 @@ flowchart LR
 |---|---|---|
 | Storage | AWS S3 + Delta Lake | ACID transactions, time travel, safe re-runs |
 | Compute — Bronze + Silver | PySpark on Amazon EMR | Distributed processing for large files (5.5GB+ reviews) |
-| Modelling — Gold | dbt on Databricks | SQL models with built-in tests, lineage docs, incremental builds |
+| Modelling — Gold + Reporting | dbt on Databricks | SQL models with built-in tests, lineage docs, incremental builds |
 | Orchestration | Apache Airflow (MWAA) | DAG-based pipeline with retry logic and SLA alerts |
 | Serving | Amazon Athena | Serverless SQL directly on Gold Delta tables |
 | Real-time (future) | Apache Kafka on MSK | Streaming extension — no pipeline redesign needed |
@@ -109,6 +114,9 @@ finalto/
 │   ├── transformation/
 │   │   └── silver_transform.py        ← PySpark: Bronze → Silver (clean & conform)
 │   │
+│   ├── tests/
+│   │   └── pipeline_tests.py          ← Data quality tests for Bronze and Silver
+│   │
 │   ├── data_engineering.md            ← Ingestion design, transformations, scalability
 │   └── sql_design_task.md             ← Rising star query + all BI scenario queries
 │
@@ -119,15 +127,16 @@ finalto/
 │   ├── sources.yml                    ← Silver source table definitions
 │   │
 │   └── models/
-│       ├── staging/                   ← stg_* models + staging.yml
-│       ├── intermediate/              ← int_* models + intermediate.yml
-│       └── marts/                     ← fact_* and dim_* models + marts.yml
+│       ├── staging/                   ← stg_* models + staging.yml (views on Silver)
+│       ├── intermediate/              ← int_* models + intermediate.yml (ephemeral)
+│       ├── marts/                     ← fact_* and dim_* models + marts.yml
+│       └── reporting/                 ← vw_* reporting views + reporting.yml
 │
 ├── docs/
 │   ├── diagrams/
 │   │   ├── data_flow_diagram.md       ← End-to-end pipeline flow diagrams
-│   │   ├── data_lineage_diagram.md    ← Source-to-Gold field traceability
-│   │   └── erd_diagram.md             ← Source ERD and Gold star schema ERD
+│   │   ├── data_lineage_diagram.md    ← Source-to-reporting field traceability
+│   │   └── erd_diagram.md             ← Source ERD, Gold star schema, reporting views
 │   │
 │   └── architecture.md               ← Tech stack decisions and trade-offs
 │
@@ -165,19 +174,23 @@ Every Gold table has automated tests that run after every build. If any test fai
 | `relationships` | Every FK in a fact table must exist in its dimension |
 | `accepted_values` | Star ratings must be 1.0 – 5.0 |
 
+### Reporting views — BI-friendly layer
+
+Reporting views sit on top of the Gold star schema. They pre-join fact and dimension tables and expose business-friendly column names. BI tools query these views — not the raw fact tables directly. Views are materialised — zero storage cost, always reflect the latest Gold data.
+
 ---
 
 ## BI Reporting Scenarios
 
 Five questions this platform answers out of the box:
 
-| # | Business question | Tables used |
+| # | Business question | Served by |
 |---|---|---|
-| 1 | Top rated businesses by city and category | `fact_reviews` + `dim_business` + `dim_date` |
-| 2 | Do Elite reviewers behave differently to regular users? | `fact_reviews` + `dim_user` |
-| 3 | Which businesses are rising stars? | `int_rising_star_candidates` + `dim_business` |
-| 4 | When is each type of business busiest? | `fact_checkins` + `dim_business` + `dim_date` |
-| 5 | How has review volume and rating changed over time? | `fact_reviews` + `dim_date` |
+| 1 | Which businesses are rising stars? | `vw_rising_stars` |
+| 2 | Top rated businesses by city and category | `vw_top_businesses_by_city` |
+| 3 | How has review volume changed over time? | `vw_review_trends` |
+| 4 | Do Elite reviewers behave differently? | `fact_reviews` + `dim_user` |
+| 5 | When is each type of business busiest? | `fact_checkins` + `dim_business` + `dim_date` |
 
 ---
 
@@ -237,13 +250,20 @@ spark-submit data_engineering/transformation/silver_transform.py \
   --env prod --date 2026-04-26 --lookback 3
 ```
 
-### Gold layer — dbt
+### Data quality tests
+```bash
+spark-submit data_engineering/tests/pipeline_tests.py --layer bronze --env prod
+spark-submit data_engineering/tests/pipeline_tests.py --layer silver --env prod
+```
+
+### Gold + Reporting — dbt
 ```bash
 cd dbt
 dbt deps                         # install dbt_utils
 dbt run --select staging         # build staging views
 dbt run --select intermediate    # build intermediate models
 dbt run --select marts           # build Gold fact and dim tables
+dbt run --select reporting       # build reporting views
 dbt test                         # run all quality tests
 dbt docs generate && dbt docs serve   # view lineage graph
 ```
@@ -255,11 +275,11 @@ dbt docs generate && dbt docs serve   # view lineage graph
 | Document | Location | What's inside |
 |---|---|---|
 | Architecture | `docs/architecture.md` | Full tech stack decisions, trade-offs, and alternatives |
-| Data model | `data_engineering/data_engineering.md` | Every entity, every field, transformation logic, scalability |
+| Data engineering | `data_engineering/data_engineering.md` | Ingestion, transformation logic, scalability |
 | SQL queries | `data_engineering/sql_design_task.md` | Rising star query + 6 BI scenario queries |
-| ERD | `docs/diagrams/erd_diagram.md` | Source ERD and Gold star schema ERD |
+| ERD | `docs/diagrams/erd_diagram.md` | Source ERD, Gold star schema, reporting views |
 | Data flow | `docs/diagrams/data_flow_diagram.md` | Pipeline flow, Airflow DAG chain, Kafka extension |
-| Data lineage | `docs/diagrams/data_lineage_diagram.md` | Field-level traceability from JSON to Gold column |
+| Data lineage | `docs/diagrams/data_lineage_diagram.md` | Field-level traceability from JSON to reporting |
 
 ---
 

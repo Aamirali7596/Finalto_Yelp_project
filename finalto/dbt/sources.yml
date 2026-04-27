@@ -30,7 +30,9 @@ sources:
             description: "Star rating given (1–5)"
           - name: review_date
             description: "Timestamp of the review (parsed from source string)"
-
+          - name: text
+            description: "Full review text — used only to derive review_length_chars at staging"
+      
       - name: business
         description: "One row per business — cleaned, typed, categories removed to bridge table"
         columns:

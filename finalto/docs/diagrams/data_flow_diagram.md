@@ -3,6 +3,8 @@
 
 ---
 
+## Main Pipeline Flow
+
 ```mermaid
 flowchart TD
     A1[business.json] --> B
@@ -11,35 +13,54 @@ flowchart TD
     A4[checkin.json]  --> B
     A5[tip.json]      --> B
 
-    B["🟤 Bronze — Raw Landing Zone
+    B["Bronze — Raw Data Landing Zone
+    ─────────────────────────────
     PySpark on EMR · Delta Lake on S3
-    Partition by ingestion date · Append only
-    Lookback 3 days to catch late-arriving data"]
+    Partitioned by ingestion date · Append only
+    Lookback 3 days to catch late-arriving data
+    Freshness checks · row count validation
+    90 day retention"]
 
-    B -->|PySpark cleans & types| C
+    B -->|"PySpark cleans and types"| C
 
-    C["🟡 Silver — Cleaned & Conformed
-    Cast types · Remove duplicates
-    Explode categories and checkins
-    Derive is_elite flag · Partition by year / month"]
+    C["Silver — Cleaned and Conformed
+    ─────────────────────────────
+    Cast all types · Remove duplicates
+    Explode categories string into rows
+    Explode checkin date blob into events
+    Derive is_elite boolean flag
+    Partitioned by year and month · 1 year retention"]
 
-    C -->|dbt models on Databricks| D
+    C -->|"dbt staging + intermediate"| D
 
-    D["🟣 Gold — BI-Ready Star Schema
+    D["Gold — Star Schema
+    ─────────────────────────────
     fact_reviews · fact_checkins
     dim_business · dim_user · dim_date
-    dbt tests on every run · Z-ordered for fast queries"]
+    dbt tests on every run
+    Incremental builds · Z-ordered for fast queries
+    Indefinite retention"]
 
-    D --> E1[Amazon Athena]
-    D --> E2[Looker / Tableau]
-    D --> E3[Data science / ML]
+    D -->|"dbt reporting views"| E
 
-    style B fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style C fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style D fill:#EEEDFE,stroke:#534AB7,color:#26215C
-    style E1 fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
-    style E2 fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
-    style E3 fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    E["Reporting — BI-Ready Views
+    ─────────────────────────────
+    vw_rising_stars
+    vw_top_businesses_by_city
+    vw_review_trends
+    Always fresh · no extra storage cost"]
+
+    E --> F1[Amazon Athena\nAd-hoc SQL on S3]
+    E --> F2[Looker / Tableau\nBI dashboards]
+    E --> F3[Data science\nML and features]
+
+    style B fill:#E1F5EE,stroke:#085041,color:#04342C
+    style C fill:#E1F5EE,stroke:#085041,color:#04342C
+    style D fill:#EEEDFE,stroke:#3C3489,color:#26215C
+    style E fill:#EEEDFE,stroke:#3C3489,color:#26215C
+    style F1 fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    style F2 fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    style F3 fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
 ```
 
 ---
@@ -48,36 +69,50 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    A[dag_bronze_ingestion\n06:00 UTC daily] -->|on SUCCESS| B[dag_silver_transform]
-    B -->|on SUCCESS| C[dag_gold_dbt]
-    C --> D[dbt run]
-    D --> E[dbt test]
-    E --> F[dbt docs generate]
+    A["dag_bronze_ingestion
+    06:00 UTC daily"] -->|"on SUCCESS"| B["dag_silver_transform
+    triggered after Bronze"]
+    B -->|"on SUCCESS"| C["dag_gold_dbt
+    triggered after Silver"]
+    C --> D[dbt run staging]
+    D --> E[dbt run intermediate]
+    E --> F[dbt run marts]
+    F --> G[dbt run reporting]
+    G --> H[dbt test]
+    H --> I[dbt docs generate]
 
-    style A fill:#EEEDFE,stroke:#534AB7,color:#26215C
-    style B fill:#EEEDFE,stroke:#534AB7,color:#26215C
-    style C fill:#EEEDFE,stroke:#534AB7,color:#26215C
+    style A fill:#EEEDFE,stroke:#3C3489,color:#26215C
+    style B fill:#EEEDFE,stroke:#3C3489,color:#26215C
+    style C fill:#EEEDFE,stroke:#3C3489,color:#26215C
 ```
 
-**If any stage fails, the chain stops.** Silver never runs if Bronze fails. Gold never runs if Silver fails. BI is never served stale or invalid data.
+> If any stage fails the chain stops. BI is never served stale or invalid data.
 
 ---
 
-## Future State — Real-Time Extension
+## Real-Time Extension — Kafka
 
 ```mermaid
 flowchart LR
-    K[Kafka MSK\nyelp.reviews topic] -->|30s micro-batch| S[Spark Structured Streaming]
-    S -->|exactly-once via Delta MERGE| B[Bronze Delta tables\nsame schema · same S3 paths]
-    B --> SIL[Silver → Gold\nunchanged pipeline]
+    K["Apache Kafka on MSK
+    Topics: yelp.reviews
+    yelp.checkins · yelp.tips"] -->|"30 second micro-batch"| S["Spark Structured Streaming
+    Exactly-once delivery
+    via Delta Lake MERGE"]
 
-    style K fill:#FAEEDA,stroke:#BA7517,color:#412402
-    style S fill:#FAEEDA,stroke:#BA7517,color:#412402
-    style B fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style SIL fill:#EEEDFE,stroke:#534AB7,color:#26215C
+    S -->|"same schema · same S3 paths"| B["Bronze Delta Tables
+    Batch and streaming coexist
+    transparently"]
+
+    B --> SIL["Silver → Gold → Reporting
+    Unchanged pipeline
+    Source agnostic"]
+
+    style K fill:#FAEEDA,stroke:#854F0B,color:#412402
+    style S fill:#FAEEDA,stroke:#854F0B,color:#412402
+    style B fill:#E1F5EE,stroke:#085041,color:#04342C
+    style SIL fill:#EEEDFE,stroke:#3C3489,color:#26215C
 ```
-
-Batch and streaming write to the same Bronze Delta tables. Downstream Silver and Gold pipelines are source-agnostic — they don't know or care whether data arrived via file or Kafka.
 
 ---
 

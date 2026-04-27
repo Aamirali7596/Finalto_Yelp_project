@@ -53,7 +53,7 @@ erDiagram
 
 ---
 
-## Gold Star Schema ERD
+## Gold Star Schema ERD — what BI queries
 
 ```mermaid
 erDiagram
@@ -111,4 +111,16 @@ erDiagram
 
 ---
 
-*Source ERD → raw Yelp JSON shape. Gold ERD → what the BI team queries.*
+## Reporting Views — on top of Gold
+
+The reporting layer sits on top of the Gold star schema. These are views — no extra storage, always fresh.
+
+| View | Built from | What it answers |
+|---|---|---|
+| `vw_rising_stars` | `fact_reviews` + `dim_business` | Which businesses have improved their rating by 1+ star? |
+| `vw_top_businesses_by_city` | `fact_reviews` + `dim_business` + `dim_date` | Best rated businesses per city and category per year |
+| `vw_review_trends` | `fact_reviews` + `dim_date` | How has review volume and average rating changed over time? |
+
+---
+
+*Source ERD → raw Yelp JSON shape. Gold ERD → what the BI team queries. Reporting views → pre-joined answers for dashboards.*
