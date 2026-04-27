@@ -5,6 +5,24 @@ Reads raw Yelp JSON files from S3 and writes to Delta Lake (Bronze).
 Lookback: Re-processes the last N days on every run to catch
           late-arriving source data. Safe to re-run — dynamic
           partition overwrite only replaces affected partitions.
+
+Schema Drift Handling:
+  Detects new columns (warn + keep), missing columns (warn + null fill),
+  and type changes (halt + alert) before writing to Bronze.
+  All drift events written to audit/schema_drift Delta table.
+
+Partial Failure Handling:
+  After every write, the partition is read back and row count is
+  verified against what was written. A mismatch halts the job and
+  triggers an Airflow retry. Delta Lake ACID transactions prevent
+  partial writes from being visible, but we verify explicitly so
+  "written" and "readable" are confirmed separately.
+
+Reprocessing:
+  Any date partition can be safely replayed:
+    --date 2026-04-24 --lookback 1 --entity reviews
+  See reprocessing strategy comments in this file for full detail.
+
 Usage:
   spark-submit bronze_ingestion.py --env prod --date 2026-04-26 --lookback 3
 """
@@ -13,7 +31,7 @@ import argparse
 import logging
 from datetime import date, datetime, timedelta
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType, StructField,
@@ -50,6 +68,8 @@ MIN_ROW_COUNTS = {
 # Always define schemas explicitly — never use inferSchema=True.
 # Spark samples 1% of the file to infer types which can silently
 # mistype fields (e.g. stars as StringType instead of IntegerType).
+# These schemas are the contract between source and pipeline.
+# Any deviation is detected by check_schema_drift() before writing.
 
 SCHEMAS = {
     "business": StructType([
@@ -104,6 +124,191 @@ SCHEMAS = {
 }
 
 
+# ── Schema Drift Detection ────────────────────────────────────────
+
+def check_schema_drift(
+    spark: SparkSession,
+    entity: str,
+    actual_df: DataFrame,
+    audit_path: str,
+    run_date: str,
+) -> DataFrame:
+    """
+    Compare the incoming DataFrame schema against the registered
+    expected schema (SCHEMAS dict). Detects three drift scenarios:
+
+      NEW columns    — source added a field we don't know about
+                       Action: log WARNING, keep the column (additive)
+
+      MISSING columns — source dropped a field we expected
+                        Action: log WARNING, add null column so
+                        downstream Silver transforms don't break
+
+      TYPE changes   — a field changed its data type
+                       Action: raise RuntimeError — this is a
+                       breaking change that requires human review
+                       before the pipeline can proceed
+
+    Returns the (possibly adjusted) DataFrame safe to write to Bronze.
+    """
+    expected_schema = SCHEMAS[entity]
+    expected_fields = {f.name: f.dataType.simpleString() for f in expected_schema.fields}
+    actual_fields   = {f.name: f.dataType.simpleString() for f in actual_df.schema.fields}
+
+    new_cols     = set(actual_fields) - set(expected_fields)
+    missing_cols = set(expected_fields) - set(actual_fields)
+    type_changes = {
+        col: (expected_fields[col], actual_fields[col])
+        for col in set(expected_fields) & set(actual_fields)
+        if expected_fields[col] != actual_fields[col]
+        and col != "ingestion_date"   # exclude our own stamp column
+    }
+
+    drift_detected = bool(new_cols or missing_cols or type_changes)
+
+    # ── New columns ───────────────────────────────────────────────
+    # Additive changes are safe. Log them and keep the data.
+    # Silver will ignore unknown columns — they won't break anything.
+    # Add to SCHEMAS and Silver transforms in the next sprint.
+    if new_cols:
+        log.warning(
+            f"[{entity}] SCHEMA DRIFT — new columns detected: {sorted(new_cols)}. "
+            f"These columns are unknown to the pipeline. "
+            f"They will be written to Bronze but Silver will not process them. "
+            f"Add them to SCHEMAS and silver_transform.py to include in Silver."
+        )
+
+    # ── Missing columns ───────────────────────────────────────────
+    # A column we expected is absent from the source file.
+    # Insert a null column to preserve the Bronze schema contract
+    # so Silver transforms don't fail on a missing column reference.
+    if missing_cols:
+        log.warning(
+            f"[{entity}] SCHEMA DRIFT — expected columns missing from source: "
+            f"{sorted(missing_cols)}. Null columns inserted to preserve schema."
+        )
+        for col_name in missing_cols:
+            expected_field = next(f for f in expected_schema.fields if f.name == col_name)
+            actual_df = actual_df.withColumn(
+                col_name,
+                F.lit(None).cast(expected_field.dataType)
+            )
+
+    # ── Type changes ──────────────────────────────────────────────
+    # A type change is a breaking change. Casting silently could corrupt
+    # data (e.g. DoubleType → StringType on stars would break all averages).
+    # Halt the pipeline and require a human decision.
+    if type_changes:
+        msg = (
+            f"[{entity}] SCHEMA DRIFT — BREAKING TYPE CHANGES DETECTED: "
+            + ", ".join(
+                f"{col}: expected {exp} got {got}"
+                for col, (exp, got) in type_changes.items()
+            )
+            + ". Pipeline halted. Review source schema change before re-running."
+        )
+        log.error(msg)
+        # Write drift record to audit before halting
+        _write_drift_audit(spark, audit_path, entity, run_date, new_cols, missing_cols, type_changes)
+        raise RuntimeError(msg)
+
+    # Write drift audit record if any drift was detected
+    if drift_detected:
+        _write_drift_audit(spark, audit_path, entity, run_date, new_cols, missing_cols, type_changes)
+
+    return actual_df
+
+
+def _write_drift_audit(spark, audit_path, entity, run_date, new_cols, missing_cols, type_changes):
+    """Write schema drift event to audit table for tracking and alerting."""
+    drift_summary = {
+        "new_columns":     str(sorted(new_cols))     if new_cols     else "",
+        "missing_columns": str(sorted(missing_cols)) if missing_cols else "",
+        "type_changes":    str(type_changes)         if type_changes else "",
+    }
+    spark.createDataFrame([{
+        "entity":        entity,
+        "layer":         "bronze",
+        "event_type":    "schema_drift",
+        "run_date":      run_date,
+        "run_timestamp": datetime.utcnow().isoformat(),
+        "details":       str(drift_summary),
+    }]).write.format("delta").mode("append").save(f"{audit_path}/schema_drift")
+    log.info(f"[{entity}] Schema drift event written to audit")
+
+
+# ── Post-Write Verification ───────────────────────────────────────
+
+def verify_write(
+    spark: SparkSession,
+    bronze_path: str,
+    entity: str,
+    run_date: str,
+    expected_count: int,
+) -> None:
+    """
+    After writing to Bronze, read back the partition we just wrote
+    and confirm the row count matches what we intended to write.
+
+    Why this matters:
+      Delta Lake's ACID transactions prevent partial writes from being
+      visible to readers — if the write fails, the transaction rolls back.
+      However, we verify anyway because:
+        1. It confirms the partition is queryable (no corruption in files)
+        2. It catches edge cases like S3 eventual consistency issues
+        3. It provides an explicit audit trail of what landed vs what was read
+        4. It is the difference between "we wrote X rows" and "X rows are readable"
+
+    If the counts don't match — the partition is flagged as suspect
+    and the job fails loudly so Airflow retries the full ingestion.
+    """
+    written_df = (
+        spark.read
+        .format("delta")
+        .load(f"{bronze_path}/{entity}")
+        .filter(F.col("ingestion_date") == run_date)
+    )
+    written_count = written_df.count()
+
+    if written_count != expected_count:
+        raise RuntimeError(
+            f"[{entity}] POST-WRITE VERIFICATION FAILED — "
+            f"wrote {expected_count:,} rows but only {written_count:,} are readable. "
+            f"Partition ingestion_date={run_date} may be corrupt. "
+            f"Re-run with --entity {entity} --date {run_date} to replay."
+        )
+
+    log.info(
+        f"[{entity}] Post-write verification passed — "
+        f"{written_count:,} rows confirmed readable in Bronze ✓"
+    )
+
+
+# ── Reprocessing Strategy ─────────────────────────────────────────
+#
+# How to reprocess a specific date if a partition is corrupt or missing:
+#
+#   spark-submit bronze_ingestion.py \
+#     --env prod \
+#     --date 2026-04-24 \   ← the date to reprocess
+#     --lookback 1 \        ← 1 day = only that date, nothing else
+#     --entity reviews      ← optional: specific entity only
+#
+# Dynamic partition overwrite means only the April 24 partition is
+# replaced. All other dates remain untouched.
+#
+# For a full backfill (e.g. after a source schema fix):
+#   spark-submit bronze_ingestion.py \
+#     --env prod \
+#     --date 2026-04-26 \
+#     --lookback 30         ← reprocess last 30 days
+#
+# Delta Lake time travel lets you inspect what a partition looked like
+# before the reprocess:
+#   SELECT * FROM bronze.reviews VERSION AS OF 5
+#   WHERE ingestion_date = '2026-04-24'
+
+
 # ── Helpers ───────────────────────────────────────────────────────
 
 def get_lookback_dates(run_date: str, lookback_days: int) -> list[str]:
@@ -117,10 +322,13 @@ def get_lookback_dates(run_date: str, lookback_days: int) -> list[str]:
 
 def write_audit(spark, audit_path, entity, row_count, run_date, status, error=""):
     spark.createDataFrame([{
-        "entity": entity, "layer": "bronze",
-        "row_count": row_count, "run_date": run_date,
+        "entity":        entity,
+        "layer":         "bronze",
+        "row_count":     row_count,
+        "run_date":      run_date,
         "run_timestamp": datetime.utcnow().isoformat(),
-        "status": status, "error": error,
+        "status":        status,
+        "error":         error,
     }]).write.format("delta").mode("append").save(audit_path)
 
 
@@ -162,6 +370,8 @@ FRESHNESS_COLS = {
 def ingest_entity(spark, entity, source_file, landing_path, bronze_path, audit_path, run_date):
     log.info(f"[{entity}] Starting ingestion")
 
+    # Read with PERMISSIVE mode — bad rows go to _corrupt_record
+    # rather than crashing the job. We log and drop them.
     df = (
         spark.read
         .schema(SCHEMAS[entity])
@@ -183,15 +393,24 @@ def ingest_entity(spark, entity, source_file, landing_path, bronze_path, audit_p
 
     df = df.withColumn("ingestion_date", F.lit(run_date))
 
-    # Validate
+    # ── Schema drift check ────────────────────────────────────────
+    # Detects new columns (warn + keep), missing columns (warn + null fill),
+    # and type changes (error + halt). Must run before write so drift is
+    # caught before bad data lands in Bronze.
+    df = check_schema_drift(spark, entity, df, audit_path, run_date)
+
+    # ── Row count validation ──────────────────────────────────────
     count = df.count()
     check_row_count(entity, count)
 
-    # Freshness check on date columns where applicable
+    # ── Freshness check ───────────────────────────────────────────
     if entity in FRESHNESS_COLS:
         check_freshness(df, entity, FRESHNESS_COLS[entity])
 
-    # Write to Bronze — dynamic partition overwrite keeps other dates safe
+    # ── Write to Bronze ───────────────────────────────────────────
+    # mergeSchema=false: if schema has drifted in a way check_schema_drift
+    # didn't catch (e.g. non-breaking struct changes), fail rather than
+    # silently alter the Bronze table schema.
     (
         df.write
         .format("delta")
@@ -200,6 +419,11 @@ def ingest_entity(spark, entity, source_file, landing_path, bronze_path, audit_p
         .partitionBy("ingestion_date")
         .save(f"{bronze_path}/{entity}")
     )
+
+    # ── Post-write verification ───────────────────────────────────
+    # Read back the partition we just wrote and confirm count matches.
+    # Catches write corruption before Silver runs on bad data.
+    verify_write(spark, bronze_path, entity, run_date, count)
 
     write_audit(spark, audit_path, entity, count, run_date, "SUCCESS")
     log.info(f"[{entity}] Bronze complete — {count:,} rows ✓")
@@ -218,9 +442,9 @@ def main():
     # For a daily batch export the full source file is re-read each run.
     # The lookback window determines how many date partitions to overwrite,
     # not which records to filter from the source file.
-    paths = PATHS[args.env]
-    dates = get_lookback_dates(args.date, args.lookback)
-    run_date = dates[-1]   # latest date in the window = partition key
+    paths    = PATHS[args.env]
+    dates    = get_lookback_dates(args.date, args.lookback)
+    run_date = dates[-1]
 
     spark = (
         SparkSession.builder
@@ -237,7 +461,10 @@ def main():
 
     for entity, source_file in entities.items():
         try:
-            ingest_entity(spark, entity, source_file, paths["landing"], paths["bronze"], paths["audit"], run_date)
+            ingest_entity(
+                spark, entity, source_file,
+                paths["landing"], paths["bronze"], paths["audit"], run_date,
+            )
         except Exception as e:
             log.error(f"[{entity}] FAILED: {e}", exc_info=True)
             failed.append(entity)

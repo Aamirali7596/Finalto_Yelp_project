@@ -1,16 +1,33 @@
 -- fact_reviews.sql
--- Gold mart: primary analytical fact table.
--- Grain       : one row per review
--- Materialised: incremental (only new rows processed per run)
--- Partition   : year
--- Z-order     : applied via post_hook on business_id, user_id
+-- ─────────────────────────────────────────────────────────────────
+-- GRAIN: One row per unique review (review_id)
+--
+-- What one row means:
+--   A single review written by one user about one business on one date.
+--   review_id is the natural key — it uniquely identifies a review
+--   in the Yelp source system.
+--
+-- Grain enforcement:
+--   unique_key = 'review_id' in config → dbt upserts on this key
+--   unique + not_null tests on review_id in marts.yml
+--   assert_fact_grain_violations.sql singular test (dbt/tests/)
+--
+-- What would break the grain:
+--   - A JOIN that fans out rows (e.g. joining to a multi-row dim)
+--   - A source dedup failure producing duplicate review_ids
+--   Both are caught by the unique test on review_id.
+--
+-- Materialised : incremental — only new rows per run
+-- Partition    : year / month
+-- Z-order      : business_id, user_id (applied via post_hook)
+-- ─────────────────────────────────────────────────────────────────
 
 {{
     config(
-        materialized  = 'incremental',
-        unique_key    = 'review_id',
+        materialized     = 'incremental',
+        unique_key       = 'review_id',
         on_schema_change = 'fail',
-        post_hook     = [
+        post_hook        = [
             "OPTIMIZE {{ this }} ZORDER BY (business_id, user_id)"
         ]
     )

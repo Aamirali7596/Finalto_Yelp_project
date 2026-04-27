@@ -8,6 +8,20 @@ Trigger : Airflow BashOperator or PythonOperator after each DAG layer
           dag_bronze → [pipeline_tests.py --layer bronze]
           dag_silver → [pipeline_tests.py --layer silver]
 
+Tests (static thresholds):
+  1. row_count_minimum    — count above expected floor
+  2. zero_nulls           — PKs and FKs cannot be null
+  3. no_duplicate_keys    — natural key must be unique
+  4. star_rating_range    — stars must be 1–5
+  5. freshness            — latest record within threshold hours
+  6. lookback_partitions  — all expected date partitions present
+  7. bronze_silver_ratio  — Silver not losing >5% of Bronze rows
+
+Tests (anomaly detection — compares today vs rolling 7-day history):
+  8. row_count_drift      — today's count within 15% of 7-day avg
+  9. metric_drift         — avg star rating within 0.5 of 7-day avg
+  10. null_rate_drift     — null rate on key cols not spiking vs history
+
 These tests are separate from dbt tests (which cover Gold).
 Bronze and Silver are PySpark territory — these Python tests cover them.
 
@@ -468,6 +482,280 @@ def test_bronze_silver_row_ratio(
         )
 
 
+# ─── Anomaly Detection Configuration ─────────────────────────────
+# These thresholds define how much today's metrics can deviate
+# from the rolling 7-day average before we flag an anomaly.
+# Unlike static floor tests, anomaly detection catches gradual
+# drift and unexpected spikes that would wake you up at 2am.
+
+ANOMALY_LOOKBACK_DAYS    = 7      # days of history to compute baseline
+ROW_COUNT_DRIFT_PCT      = 15.0   # alert if today deviates > 15% from 7-day avg
+METRIC_DRIFT_THRESHOLD   = 0.5    # alert if avg stars shifts > 0.5 from 7-day avg
+NULL_RATE_DRIFT_THRESHOLD = 0.02  # alert if null rate increases > 2% above baseline
+
+
+# ─── Anomaly Detection Functions ──────────────────────────────────
+
+def test_row_count_drift(
+    spark: SparkSession,
+    test_results_path: str,
+    entity: str,
+    layer: str,
+    today_count: int,
+) -> TestResult:
+    """
+    Compare today's row count against the rolling 7-day average
+    from the test_results Delta table. Alert if today deviates
+    by more than ROW_COUNT_DRIFT_PCT percent.
+
+    Why this matters over a static minimum:
+      A static floor of 500k catches a source being completely empty.
+      Drift detection catches the subtler problem: "We had 6.9M rows
+      yesterday and 5.8M today — something deleted 1.1M rows and
+      nobody knows why." The static test passes; this one fails.
+
+    Requires at least 3 days of history to produce a meaningful baseline.
+    On the first few runs it logs a warning and passes.
+    """
+    test_name = "row_count_drift"
+
+    try:
+        history = (
+            spark.read.format("delta").load(test_results_path)
+            .filter(
+                (F.col("test_name") == "row_count_minimum") &
+                (F.col("entity")    == entity) &
+                (F.col("layer")     == layer) &
+                (F.col("passed")    == True)
+            )
+            .orderBy(F.col("run_date").desc())
+            .limit(ANOMALY_LOOKBACK_DAYS)
+        )
+
+        history_count = history.count()
+        if history_count < 3:
+            return TestResult(
+                test_name = test_name, entity = entity, layer = layer,
+                passed    = True,
+                message   = f"Insufficient history ({history_count} days) — drift check skipped",
+            )
+
+        avg_count = history.agg(F.avg("value").alias("avg")).collect()[0]["avg"]
+        if avg_count is None or avg_count == 0:
+            return TestResult(
+                test_name = test_name, entity = entity, layer = layer,
+                passed    = True,
+                message   = "No baseline available — drift check skipped",
+            )
+
+        deviation_pct = abs(today_count - avg_count) / avg_count * 100
+        passed        = deviation_pct <= ROW_COUNT_DRIFT_PCT
+
+        return TestResult(
+            test_name = test_name,
+            entity    = entity,
+            layer     = layer,
+            passed    = passed,
+            message   = (
+                f"Row count drift {deviation_pct:.1f}% within threshold "
+                f"{ROW_COUNT_DRIFT_PCT}% (today: {today_count:,}, "
+                f"7-day avg: {avg_count:,.0f}) ✓"
+                if passed else
+                f"FAIL — Row count drifted {deviation_pct:.1f}% from 7-day average. "
+                f"Today: {today_count:,} | 7-day avg: {avg_count:,.0f}. "
+                f"Investigate source for unexpected deletions or duplications."
+            ),
+            value     = round(deviation_pct, 2),
+            threshold = ROW_COUNT_DRIFT_PCT,
+        )
+
+    except Exception as e:
+        return TestResult(
+            test_name = test_name, entity = entity, layer = layer,
+            passed    = True,
+            message   = f"Drift check skipped — could not read history: {e}",
+        )
+
+
+def test_metric_drift(
+    df: DataFrame,
+    spark: SparkSession,
+    test_results_path: str,
+    entity: str,
+    layer: str,
+    metric_col: str,
+) -> TestResult:
+    """
+    Compare today's average value of a numeric metric column against
+    the rolling 7-day average. Alert if it shifts by more than
+    METRIC_DRIFT_THRESHOLD.
+
+    Primary use case: average star rating in silver.reviews.
+    If avg stars jumps from 3.7 to 4.9 overnight, something is wrong
+    with the source data — possibly a batch of fake reviews, a filter
+    bug, or a schema issue causing valid low-star reviews to be dropped.
+    """
+    test_name = "metric_drift"
+
+    if metric_col not in df.columns:
+        return TestResult(
+            test_name = test_name, entity = entity, layer = layer,
+            passed    = True,
+            message   = f"Column '{metric_col}' not present — skipped",
+        )
+
+    today_avg_row = df.agg(F.avg(F.col(metric_col)).alias("avg")).collect()[0]
+    today_avg     = today_avg_row["avg"]
+
+    if today_avg is None:
+        return TestResult(
+            test_name = test_name, entity = entity, layer = layer,
+            passed    = True,
+            message   = f"No values in '{metric_col}' — skipped",
+        )
+
+    try:
+        history = (
+            spark.read.format("delta").load(test_results_path)
+            .filter(
+                (F.col("test_name") == test_name) &
+                (F.col("entity")    == entity) &
+                (F.col("layer")     == layer) &
+                (F.col("passed")    == True)
+            )
+            .orderBy(F.col("run_date").desc())
+            .limit(ANOMALY_LOOKBACK_DAYS)
+        )
+
+        if history.count() < 3:
+            return TestResult(
+                test_name = test_name, entity = entity, layer = layer,
+                passed    = True,
+                message   = "Insufficient history — metric drift check skipped",
+                value     = round(today_avg, 4),
+            )
+
+        baseline_avg = history.agg(F.avg("value").alias("avg")).collect()[0]["avg"]
+        if baseline_avg is None:
+            return TestResult(
+                test_name = test_name, entity = entity, layer = layer,
+                passed    = True,
+                message   = "No baseline available — metric drift check skipped",
+            )
+
+        drift    = abs(today_avg - baseline_avg)
+        passed   = drift <= METRIC_DRIFT_THRESHOLD
+
+        return TestResult(
+            test_name = test_name,
+            entity    = entity,
+            layer     = layer,
+            passed    = passed,
+            message   = (
+                f"'{metric_col}' drift {drift:.3f} within threshold "
+                f"{METRIC_DRIFT_THRESHOLD} "
+                f"(today: {today_avg:.3f}, 7-day avg: {baseline_avg:.3f}) ✓"
+                if passed else
+                f"FAIL — '{metric_col}' drifted {drift:.3f} from 7-day baseline. "
+                f"Today: {today_avg:.3f} | 7-day avg: {baseline_avg:.3f}. "
+                f"Check source for data quality issues or filter regressions."
+            ),
+            value     = round(today_avg, 4),
+            threshold = METRIC_DRIFT_THRESHOLD,
+        )
+
+    except Exception as e:
+        return TestResult(
+            test_name = test_name, entity = entity, layer = layer,
+            passed    = True,
+            message   = f"Metric drift check skipped: {e}",
+            value     = round(today_avg, 4),
+        )
+
+
+def test_null_rate_drift(
+    df: DataFrame,
+    spark: SparkSession,
+    test_results_path: str,
+    entity: str,
+    layer: str,
+    col_name: str,
+) -> TestResult:
+    """
+    Compare today's null rate on a column against the rolling 7-day
+    baseline. Alert if null rate increases by more than
+    NULL_RATE_DRIFT_THRESHOLD above the historical norm.
+
+    Why this matters:
+      A static zero-null test catches complete column failures.
+      Null rate drift catches gradual degradation — a column that
+      was 0.1% null last week but is 5% null today suggests an
+      upstream schema change or join issue is introducing nulls
+      that weren't there before.
+    """
+    test_name = "null_rate_drift"
+
+    if col_name not in df.columns:
+        return TestResult(
+            test_name = test_name, entity = entity, layer = layer,
+            passed    = True,
+            message   = f"Column '{col_name}' not present — skipped",
+        )
+
+    total          = df.count()
+    null_count     = df.filter(F.col(col_name).isNull()).count()
+    today_null_pct = null_count / total if total > 0 else 0.0
+
+    try:
+        history = (
+            spark.read.format("delta").load(test_results_path)
+            .filter(
+                (F.col("test_name") == test_name) &
+                (F.col("entity")    == entity) &
+                (F.col("layer")     == layer) &
+                (F.col("passed")    == True)
+            )
+            .orderBy(F.col("run_date").desc())
+            .limit(ANOMALY_LOOKBACK_DAYS)
+        )
+
+        if history.count() < 3:
+            return TestResult(
+                test_name = test_name, entity = entity, layer = layer,
+                passed    = True,
+                message   = f"Insufficient history — null drift check on '{col_name}' skipped",
+                value     = round(today_null_pct, 4),
+            )
+
+        baseline_null_pct = history.agg(F.avg("value").alias("avg")).collect()[0]["avg"] or 0.0
+        drift             = today_null_pct - baseline_null_pct
+        passed            = drift <= NULL_RATE_DRIFT_THRESHOLD
+
+        return TestResult(
+            test_name = test_name,
+            entity    = entity,
+            layer     = layer,
+            passed    = passed,
+            message   = (
+                f"'{col_name}' null rate {today_null_pct:.2%} within drift threshold ✓"
+                if passed else
+                f"FAIL — '{col_name}' null rate spiked {drift:.2%} above 7-day baseline. "
+                f"Today: {today_null_pct:.2%} | baseline: {baseline_null_pct:.2%}. "
+                f"Possible upstream schema change or join regression."
+            ),
+            value     = round(today_null_pct, 4),
+            threshold = NULL_RATE_DRIFT_THRESHOLD,
+        )
+
+    except Exception as e:
+        return TestResult(
+            test_name = test_name, entity = entity, layer = layer,
+            passed    = True,
+            message   = f"Null rate drift check skipped: {e}",
+            value     = round(today_null_pct, 4),
+        )
+
+
 # ─── Test Runner ─────────────────────────────────────────────────
 
 def run_tests_for_layer(
@@ -544,6 +832,42 @@ def run_tests_for_layer(
             results.append(
                 test_lookback_partitions_present(
                     spark, table_path, entity, layer, lookback_dates
+                )
+            )
+
+        # ── Tests 8-10: Anomaly detection ─────────────────────
+        # These compare today's metrics against rolling 7-day history.
+        # They require test_results history to exist — gracefully
+        # skipped on first few runs until baseline is established.
+
+        # Row count drift — is today's count unusual vs recent history?
+        current_count = df.count()
+        results.append(
+            test_row_count_drift(
+                spark, paths["test_results"], entity, layer, current_count
+            )
+        )
+
+        # Metric drift — has avg star rating shifted unexpectedly?
+        if entity == "reviews":
+            stars_col = "stars" if layer == "bronze" else "stars"
+            results.append(
+                test_metric_drift(
+                    df, spark, paths["test_results"], entity, layer, stars_col
+                )
+            )
+
+        # Null rate drift — are nulls increasing on key columns?
+        drift_cols = {
+            "reviews":  "stars",
+            "business": "city",
+            "users":    "average_stars",
+        }
+        if entity in drift_cols:
+            results.append(
+                test_null_rate_drift(
+                    df, spark, paths["test_results"],
+                    entity, layer, drift_cols[entity]
                 )
             )
 

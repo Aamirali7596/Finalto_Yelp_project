@@ -3,10 +3,15 @@ version: 2
 # ─── Mart Models ──────────────────────────────────────────────────
 # The Gold star schema. These are the tables BI tools query.
 #
+# Grain is explicitly defined for every fact table.
+# Grain violations are caught by:
+#   1. unique + not_null tests on the PK column (schema tests)
+#   2. assert_fact_grain_violations.sql singular test (dbt/tests/)
+#
 # Fact tables  : incremental materialisation — only new rows per run
 # Dimension tables: table materialisation — full refresh (SCD Type 1)
 #
-# All foreign key relationships are enforced via dbt relationships tests.
+# All foreign key relationships enforced via dbt relationships tests.
 # A failed FK test means a fact row references a dimension that doesn't
 # exist — this blocks the DAG before BI is served.
 
@@ -16,12 +21,16 @@ models:
 
   - name: fact_reviews
     description: >
-      Primary analytical fact table. One row per review.
+      GRAIN: One row per unique review (review_id).
+      One row = one review written by one user about one business on one date.
+      review_id is the natural key from the Yelp source system.
+      Grain is enforced by unique + not_null tests on review_id and by
+      the assert_fact_grain_violations singular test.
       Incrementally materialised — only new reviews processed per run.
-      Z-ordered on business_id and user_id via post_hook for fast BI filtering.
+      Z-ordered on business_id and user_id for fast BI filtering.
     columns:
       - name: review_id
-        description: "Unique review identifier (PK)"
+        description: "Natural PK — unique review identifier from Yelp source. Defines the grain."
         tests:
           - unique
           - not_null
@@ -65,7 +74,7 @@ models:
         tests:
           - not_null
       - name: review_length_chars
-        description: "Character count of the review text"
+        description: "Character count of the review text — derived at staging via length(text)"
       - name: year
         description: "Year the review was written — partition column"
       - name: month
@@ -73,12 +82,19 @@ models:
 
   - name: fact_checkins
     description: >
-      Checkin events fact table. One row per checkin event.
+      GRAIN: One row per unique checkin event (checkin_id).
+      One row = one visit to one business at one specific timestamp.
+      checkin_id is a surrogate key: md5(business_id || checkin_ts).
+      Note: the source data had no per-event grain — checkin.json held
+      one row per business with all timestamps packed into a single
+      comma-separated string. Silver exploded this into individual events
+      and assigned each a deterministic surrogate key. Grain is established
+      at Silver and enforced here by unique + not_null tests on checkin_id.
       Incrementally materialised — only new events processed per run.
-      Z-ordered on business_id via post_hook.
+      Z-ordered on business_id for fast BI filtering.
     columns:
       - name: checkin_id
-        description: "Unique checkin event identifier (PK — surrogate)"
+        description: "Surrogate PK — md5(business_id || checkin_ts). Defines the grain."
         tests:
           - unique
           - not_null
@@ -99,7 +115,7 @@ models:
       - name: checkin_hour
         description: "Hour of day the checkin occurred (0–23)"
       - name: checkin_day_of_week
-        description: "Day of week the checkin occurred e.g. Monday"
+        description: "Day of week e.g. Monday, Tuesday"
       - name: year
         description: "Year of the checkin — partition column"
       - name: month
@@ -109,12 +125,13 @@ models:
 
   - name: dim_business
     description: >
-      Business dimension. One row per business (SCD Type 1 — latest state wins).
+      GRAIN: One row per business (business_id).
+      SCD Type 1 — latest state wins, no history kept.
       Full refresh on every run. primary_category is denormalised in
       from the bridge table via int_business_categories.
     columns:
       - name: business_id
-        description: "Unique business identifier (PK)"
+        description: "Natural PK — unique business identifier from Yelp source"
         tests:
           - unique
           - not_null
@@ -136,21 +153,21 @@ models:
           - accepted_values:
               values: [true, false]
       - name: primary_category
-        description: "Primary business category — first category alphabetically"
+        description: "Primary business category — first category alphabetically from bridge table"
 
   - name: dim_user
     description: >
-      User dimension. One row per user (SCD Type 1).
-      Full refresh on every run.
-      user_name is flagged as PII in metadata.
+      GRAIN: One row per user (user_id).
+      SCD Type 1 — latest state wins, no history kept.
+      Full refresh on every run. user_name is flagged as PII.
     columns:
       - name: user_id
-        description: "Unique user identifier (PK)"
+        description: "Natural PK — unique user identifier from Yelp source"
         tests:
           - unique
           - not_null
       - name: name
-        description: "User first name"
+        description: "User first name — PII, flagged in meta"
         meta:
           pii: true
       - name: review_count
@@ -158,7 +175,7 @@ models:
       - name: average_stars
         description: "Lifetime average star rating given"
       - name: is_elite
-        description: "True if user has ever been Yelp Elite"
+        description: "True if user has ever been Yelp Elite — derived from raw comma-separated year string at Silver"
         tests:
           - not_null
           - accepted_values:
@@ -178,18 +195,19 @@ models:
 
   - name: dim_date
     description: >
-      Date dimension — static date spine generated by dbt_utils.date_spine.
+      GRAIN: One row per calendar date (full_date).
+      Static date spine generated by dbt_utils.date_spine.
       Covers 2004-01-01 (earliest Yelp review) to current_date.
       Not derived from source data — built entirely by dbt.
       Rebuilt once and rarely needs updating.
     columns:
       - name: date_id
-        description: "Surrogate integer key (PK)"
+        description: "Surrogate PK — generated by dbt_utils.generate_surrogate_key"
         tests:
           - unique
           - not_null
       - name: full_date
-        description: "Calendar date"
+        description: "Calendar date — natural key of this dimension"
         tests:
           - unique
           - not_null
@@ -214,3 +232,67 @@ models:
         tests:
           - accepted_values:
               values: [true, false]
+  
+  - name: dim_business_history
+    description: >
+      GRAIN: One row per version of a business record (business_id + valid_from).
+      SCD Type 2 — tracks full history of business attribute changes.
+      Use for point-in-time queries: "What category was this business
+      in when this review was written?"
+      Use dim_business (Type 1) for current-state queries.
+      Tracked attributes: name, city, state, stars, review_count,
+      is_open, primary_category. Changes to any of these create a
+      new version row. record_hash detects changes via md5.
+    columns:
+      - name: business_id
+        description: "FK to dim_business — business natural key"
+        tests:
+          - not_null
+      - name: valid_from
+        description: "Timestamp when this version became active"
+        tests:
+          - not_null
+      - name: valid_to
+        description: "Timestamp when this version was superseded. NULL = currently active."
+      - name: is_current
+        description: "TRUE for the active version of each business"
+        tests:
+          - not_null
+      - name: record_hash
+        description: "md5 of tracked attributes — used to detect changes between pipeline runs"
+        tests:
+          - not_null
+ 
+  - name: dim_user_history
+    description: >
+      GRAIN: One row per version of a user record (user_id + valid_from).
+      SCD Type 2 — tracks full history of user attribute changes.
+      Use for point-in-time queries: "Was this user Elite when they
+      wrote this review?"
+      Use dim_user (Type 1) for current-state queries.
+      Tracked attributes: is_elite, elite_years_count, review_count,
+      average_stars, fan_count. user_name is NOT a change trigger —
+      name changes are cosmetic and don't create analytical splits.
+    columns:
+      - name: user_id
+        description: "FK to dim_user — user natural key"
+        tests:
+          - not_null
+      - name: valid_from
+        description: "Timestamp when this version became active"
+        tests:
+          - not_null
+      - name: valid_to
+        description: "Timestamp when this version was superseded. NULL = currently active."
+      - name: is_current
+        description: "TRUE for the active version of each user"
+        tests:
+          - not_null
+      - name: is_elite
+        description: "Elite status in this version of the record"
+        tests:
+          - not_null
+      - name: record_hash
+        description: "md5 of tracked analytical attributes — detects changes between runs"
+        tests:
+          - not_null    
