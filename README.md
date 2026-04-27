@@ -121,7 +121,7 @@ erDiagram
     FACT_REVIEWS  }o--|| DIM_DATE     : "on"
     FACT_CHECKINS }o--|| DIM_BUSINESS : "at"
     FACT_CHECKINS }o--|| DIM_DATE     : "on"
-
+```
 ## Repo Structure
 
 ```
